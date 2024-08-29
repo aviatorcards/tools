@@ -3,7 +3,7 @@ from scapy.all import sendp, Ether, IP, UDP
 destination_ip = '255.255.255.255'
 source_ip = '192.168.1.1'
 source_mac = '52:54:00:ac:05:8c'
-destination_mac = '52:54:00:ac:05:8c' #probably doesn't work
+destination_mac = '52:54:00:ac:05:8c' 
 source_port = 14236
 destination_port = 14235
 
