@@ -6,13 +6,13 @@ import logging
 from datetime import datetime
 import shutil
 
-LOCAL_REPOS_BASE_DIR = "/var/git"
+LOCAL_REPOS_BASE_DIR = "/var/git" # personal gitea directory, yours may differ
 
-GITHUB_USER_OR_ORG = "fddldev"
+GITHUB_USER_OR_ORG = "fddldev" # my github account name, obviously change this to yours
 
-MIRROR_WORK_DIR = "/home/$USER/github_mirror"
+MIRROR_WORK_DIR = "/home/tristan/github_mirror"
 
-USE_GH_FOR_REPO_CREATION = true
+USE_GH_FOR_REPO_CREATION = True
 GH_REPO_VISIBILITY = "--public"
 
 LOG_FILE = os.path.join(MIRROR_WORK_DIR, "mirror_sync_python.log")
@@ -123,7 +123,7 @@ def main():
                                 gh_create_cmd = [
                                     "gh", "repo", "create", f"{GITHUB_USER_OR_ORG}/{repo_name}",
                                     GH_REPO_VISIBILITY,
-                                    "--description", f"Mirror of local repo {repo_name}"
+                                    "--description", f"Mirror of git.fddl.dev repo {repo_name}"
                                 ]
                                 run_command(gh_create_cmd)
                                 logging.info(f"Successfully created '{GITHUB_USER_OR_ORG}/{repo_name}' on GitHub via gh CLI.")
@@ -157,6 +157,7 @@ def main():
                     logging.info("Successfully fetched updates from local server.")
 
                 logging.info(f"Pushing mirror of '{repo_name}' to GitHub remote: '{github_repo_url}'")
+                run_command(["git", "config", "--global", "--add", "safe.directory", local_mirror_clone_path], cwd=local_mirror_clone_path)
                 run_command(["git", "push", "--mirror", "github"], cwd=local_mirror_clone_path)
                 logging.info(f"Successfully mirrored '{repo_name}' to GitHub.")
 
