@@ -157,7 +157,7 @@ def main():
                     logging.info("Successfully fetched updates from local server.")
 
                 logging.info(f"Pushing mirror of '{repo_name}' to GitHub remote: '{github_repo_url}'")
-                run_command(["git", "config", "--global", "--add", "safe.directory"], cwd=local_mirror_clone_path)
+                
                 run_command(["git", "push", "--mirror", "github"], cwd=local_mirror_clone_path)
                 logging.info(f"Successfully mirrored '{repo_name}' to GitHub.")
 
