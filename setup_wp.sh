@@ -10,6 +10,8 @@ export PATH="/usr/local/bin:$PATH"
 read -p "Enter the domain name (e.g., site.com): " DOMAIN
 read -p "Enter admin email (default: tristan@fddl.dev): " ADMIN_EMAIL
 ADMIN_EMAIL=${ADMIN_EMAIL:-tristan@fddl.dev}
+read -p "Enter admin username (default: tristan): " ADMIN_USER
+ADMIN_USER=${ADMIN_USER:-tristan}
 
 LAST_PORT=$(grep "Listen" /etc/httpd/conf.d/ports.conf | awk '{print $2}' | sort -n | tail -1)
 PORT=$((LAST_PORT + 1))
@@ -104,7 +106,7 @@ if command -v semanage > /dev/null; then
 fi
 
 ADMIN_PASS=$(openssl rand -base64 16)
-wp core install --url="https://$DOMAIN" --title="$DOMAIN" --admin_user="tristan" --admin_password="$ADMIN_PASS" --admin_email="$ADMIN_EMAIL" --skip-email --allow-root
+wp core install --url="https://$DOMAIN" --title="$DOMAIN" --admin_user="$ADMIN_USER" --admin_password="$ADMIN_PASS" --admin_email="$ADMIN_EMAIL" --skip-email --allow-root
 
 wp plugin install wordfence --activate --allow-root
 
@@ -132,7 +134,7 @@ echo "Port:     $PORT"
 echo "DB Name:  $DB_NAME"
 echo "DB User:  $DB_USER"
 echo "DB Pass:  $DB_PASS"
-echo "Admin:    tristan"
+echo "Admin:    $ADMIN_USER"
 echo "Pass:     $ADMIN_PASS"
 echo "------------------------------------------"
 echo "ACTION REQUIRED: Map $DOMAIN to http://localhost:$PORT in Cloudflare."
