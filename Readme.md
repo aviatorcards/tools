@@ -59,14 +59,16 @@ Ctrl-A then X.
 ### setup_wp.sh
 
 Provisions a new WordPress site on a RHEL-style host (Apache `httpd`,
-php-fpm, MySQL/MariaDB, SELinux). It prompts for a domain and admin email,
-then:
+php-fpm, MySQL/MariaDB, SELinux). It prompts for a domain, admin email and
+admin username (default `tristan`), then:
 
-1. picks the next free port after the last `Listen` in
+1. picks the next port after the highest `Listen` in
    `/etc/httpd/conf.d/ports.conf`;
-2. creates a database and user with a random password;
-3. unpacks WordPress into `/mnt/storage/www/<domain>` (from a local
-   `latest.tar.gz`/`latest.zip`, or via `wp core download`);
+2. creates a database and user with a random password (the database name is
+   the domain with dots turned into underscores);
+3. unpacks WordPress into `/var/www/html/<domain>`, from
+   `/home/tristan/latest.tar.gz` if it exists or via `wp core download`
+   otherwise;
 4. writes `wp-config.php` (honouring `X-Forwarded-Proto` so it works behind
    an HTTPS proxy), an Apache vhost, and SELinux port/file labels;
 5. installs WordPress and the Wordfence plugin, then restarts `httpd` and
@@ -75,6 +77,9 @@ then:
 It prints the generated DB and admin credentials at the end, and reminds you
 to point the domain at `http://localhost:<port>` in Cloudflare. If the
 database, web directory or vhost already exists, it asks before replacing it.
+
+`ports.conf` needs at least one `Listen` line already. There's no fallback
+port, so without one the new site would end up on port 1.
 
 ```bash
 sudo ./setup_wp.sh
