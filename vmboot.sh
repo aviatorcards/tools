@@ -10,12 +10,18 @@
 # Throwaway VMs use the same layout under $VM_ROOT/.scratch/ and are deleted
 # when QEMU exits unless you choose to keep them. $VM_ROOT/.image-history
 # records when each image was last booted, for `vmboot images` and `clean`.
+# $VM_ROOT/.catalog holds the current release images `vmboot sync` found, and
+# $VM_ROOT/mirrors (optional) overrides the built-in list of download mirrors.
 
 set -euo pipefail
 
 VM_ROOT="${VM_ROOT:-$HOME/VMs}"
 SCRATCH_ROOT="$VM_ROOT/.scratch"
 HISTORY="$VM_ROOT/.image-history"
+CATALOG="$VM_ROOT/.catalog"
+MIRRORS_FILE="$VM_ROOT/mirrors"
+CATALOG_MAX_AGE_DAYS=7
+DISTROS="fedora ubuntu alpine openbsd"
 SEARCH_DIR="$HOME/Downloads"
 DEFAULT_MEM=2G
 DEFAULT_CPUS=2
@@ -24,14 +30,22 @@ CLEAN_DAYS=30
 DRY_RUN=0
 KEEP=0
 LIVE=0
+DOWNLOAD_ONLY=0
 
 # Set from flags. Empty means "use the VM's saved value, else the default".
-opt_mem="" opt_cpus="" opt_display="" opt_ssh="" opt_firmware=""
+opt_mem="" opt_cpus="" opt_display="" opt_ssh="" opt_firmware="" opt_arch="" opt_gpu=""
+
+# Set by `get`, which already knows the image's architecture.
+known_arch=""
 
 usage() {
     cat <<EOF
 Usage: vmboot [options]               pick an image or saved VM from a menu and boot it
        vmboot [options] IMAGE         try IMAGE in a throwaway VM
+       vmboot get [options] DISTRO[/VARIANT]
+                                      download the current release and try it
+       vmboot get                     list what's available to get
+       vmboot sync                    refresh the list of current releases
        vmboot boot [options] NAME     boot a saved VM
        vmboot list                    list saved VMs
        vmboot images                  list images in the search folder
@@ -47,7 +61,9 @@ Images boot in a throwaway VM: when QEMU exits you're asked whether to keep
 it, and if not, its disk is deleted.
 
 Boot options:
-  -s DIR    where to look for .iso/.img files (default: ~/Downloads)
+  -s DIR    where to look for (and download) .iso/.img files (default: ~/Downloads)
+  -a ARCH   with get: arm64 or amd64 (default: this Mac's)
+  -d        with get: download only, don't boot
   -k        keep: make a named VM straight away instead of a throwaway one
   -l        live: boot the image with no disk at all (for live ISOs)
   -m MEM    guest RAM (default: $DEFAULT_MEM)
@@ -56,12 +72,18 @@ Boot options:
   -p PORT   forward localhost:PORT to the guest's SSH port (-p 0 turns it off)
   -f FW     x86 firmware: uefi or bios (new x86 VMs default to uefi)
   -g        graphical window
-  -t        serial console in this terminal (default for arm64 guests)
+  -t        serial console in this terminal (default for BSD installers)
+  -r        arm64: plain framebuffer (ramfb) instead of virtio-gpu, for OSes
+            that only draw to the boot framebuffer (e.g. Redox)
   -n        dry run: print the QEMU command instead of running it
   -h        show this help
 
--m, -c, -p, -f, -g and -t are saved with a VM and reused on its next boot.
+-m, -c, -p, -f, -g, -t and -r are saved with a VM and reused on its next boot.
 VMs live in $VM_ROOT/<name>/ (set VM_ROOT to keep them elsewhere).
+
+get knows: $DISTROS. Images come from the mirrors in $VM_ROOT/mirrors
+(or the built-in ones) and fall back to the official site; checksums always
+come from the official release index.
 EOF
 }
 
@@ -71,15 +93,17 @@ bad_usage() { echo "vmboot: $*" >&2; echo "Run 'vmboot -h' for usage." >&2; exit
 # ---- arguments: an optional command, then options and names in any order ----
 cmd=""
 case ${1:-} in
-    boot|list|images|clean|delete|snapshot|snapshots|restore|delsnap) cmd=$1; shift ;;
+    boot|get|sync|list|images|clean|delete|snapshot|snapshots|restore|delsnap) cmd=$1; shift ;;
 esac
 
 positional=()
 while [ $# -gt 0 ]; do
     OPTIND=1
-    while getopts ":s:m:c:z:p:f:klgtnh" opt; do
+    while getopts ":s:a:m:c:z:p:f:dklgtrnh" opt; do
         case $opt in
             s) SEARCH_DIR=$OPTARG ;;
+            a) opt_arch=$OPTARG ;;
+            d) DOWNLOAD_ONLY=1 ;;
             k) KEEP=1 ;;
             l) LIVE=1 ;;
             m) opt_mem=$OPTARG ;;
@@ -89,6 +113,7 @@ while [ $# -gt 0 ]; do
             f) opt_firmware=$OPTARG ;;
             g) opt_display=window ;;
             t) opt_display=terminal ;;
+            r) opt_gpu=ramfb ;;
             n) DRY_RUN=1 ;;
             h) usage; exit 0 ;;
             :) bad_usage "-$OPTARG needs a value" ;;
@@ -103,6 +128,12 @@ done
 [[ -z $opt_cpus || $opt_cpus =~ ^[1-9][0-9]*$ ]] || bad_usage "-c wants a number of CPUs"
 [[ -z $opt_ssh || ( $opt_ssh =~ ^[0-9]+$ && $opt_ssh -le 65535 ) ]] || bad_usage "-p wants a port number"
 case $opt_firmware in ""|uefi|bios) ;; *) bad_usage "-f wants uefi or bios" ;; esac
+case $opt_arch in
+    ""|arm64|amd64) ;;
+    aarch64) opt_arch=arm64 ;;
+    x86_64)  opt_arch=amd64 ;;
+    *) bad_usage "-a wants arm64 or amd64" ;;
+esac
 [ $KEEP -eq 1 ] && [ $LIVE -eq 1 ] && bad_usage "-k and -l don't go together"
 
 # ---- small helpers ----
@@ -254,14 +285,20 @@ cmd_list() {
 }
 
 cmd_images() {
-    local f booted found=0 total=0
+    local f booted found=0 total=0 w=5 base fmt
+    # Size the IMAGE column to the longest name.
+    while IFS= read -r f; do
+        base=$(basename "$f")
+        [ ${#base} -le $w ] || w=${#base}
+    done < <(list_images)
+    fmt="%-${w}s  %-7s %-14s %s\n"
     while IFS= read -r f; do
         if [ $found -eq 0 ]; then
-            printf '%-44s %-7s %-14s %s\n' IMAGE SIZE DOWNLOADED "LAST BOOTED"
+            printf "$fmt" IMAGE SIZE DOWNLOADED "LAST BOOTED"
             found=1
         fi
         booted=$(image_last_boot "$f")
-        printf '%-44s %-7s %-14s %s\n' "$(basename "$f")" "$(human_size "$f")" \
+        printf "$fmt" "$(basename "$f")" "$(human_size "$f")" \
             "$(fmt_age "$(stat -f %B "$f")")" "$([ -n "$booted" ] && fmt_age "$booted" || echo never)"
         total=$((total + $(du -k "$f" | cut -f1)))
     done < <(list_images)
@@ -376,17 +413,23 @@ cmd_delsnap() {
 
 # ---- boot ----
 
-# Guess the guest architecture from an image file. Prints arm64, amd64, i386
-# or nothing. Tries, in order: the file name, the ISO volume label, and the
-# EFI loader names embedded in the image.
-detect_arch() {
-    local f=$1 name label
-    name=$(basename "$f" | tr '[:upper:]' '[:lower:]')
-    case $name in
-        *aarch64*|*arm64*|*evbarm*) echo arm64; return ;;
-        *amd64*|*x86_64*|*x64*)     echo amd64; return ;;
-        *i386*|*i686*)              echo i386;  return ;;
+# Prints the architecture a file name mentions, if any.
+arch_from_name() {
+    case $(basename "$1" | tr '[:upper:]' '[:lower:]') in
+        *aarch64*|*arm64*|*evbarm*) echo arm64 ;;
+        *amd64*|*x86_64*|*x64*)     echo amd64 ;;
+        *i386*|*i686*)              echo i386 ;;
+        *) return 1 ;;
     esac
+}
+
+# Guess the guest architecture from an image file. Prints arm64, amd64 or
+# i386; several of them, space-separated, if it's not sure; or nothing.
+# Tries, in order: the file name, the ISO volume label, and the EFI loader
+# names embedded in the image.
+detect_arch() {
+    local f=$1 label found=""
+    arch_from_name "$f" && return
 
     # e.g. "ISO 9660 CD-ROM filesystem data 'OpenBSD/arm64   8.0 Install CD'"
     label=$(file -b "$f" | tr '[:upper:]' '[:lower:]')
@@ -398,9 +441,31 @@ detect_arch() {
 
     # UEFI boot loaders are named per arch: BOOTAA64.EFI, BOOTX64.EFI, BOOTIA32.EFI.
     # They show up in FAT directory entries as "BOOTAA64EFI" (8.3, no dot).
-    if LC_ALL=C grep -aqm1 -E 'BOOTAA64 ?\.?EFI' "$f"; then echo arm64; return; fi
-    if LC_ALL=C grep -aqm1 -E 'BOOTX64 ?\.?EFI' "$f";  then echo amd64; return; fi
-    if LC_ALL=C grep -aqm1 -E 'BOOTIA32 ?\.?EFI' "$f"; then echo i386;  return; fi
+    # Some images carry loaders for several arches, or mention the other
+    # names in passing, so only a single hit is conclusive.
+    LC_ALL=C grep -aqm1 -E 'BOOTAA64 ?\.?EFI' "$f" && found+=" arm64"
+    LC_ALL=C grep -aqm1 -E 'BOOTX64 ?\.?EFI' "$f"  && found+=" amd64"
+    LC_ALL=C grep -aqm1 -E 'BOOTIA32 ?\.?EFI' "$f" && found+=" i386"
+    echo "${found# }"
+}
+
+has_efi_loader() { LC_ALL=C grep -aqm1 -E 'BOOT(AA64|X64|IA32) ?\.?EFI' "$1"; }
+
+# True for an ISO 9660 image (attached as a CD), false for a disk image, even
+# one named .iso (Redox's livedisk.iso is a GPT disk).
+is_cd_image() {
+    if [ -f "$1" ]; then
+        [[ $(file -b "$1") == *"ISO 9660"* ]]
+    else
+        case $1 in *.iso|*.ISO) return 0 ;; *) return 1 ;; esac
+    fi
+}
+
+# BSD installers expect a serial console; most other things want a screen.
+is_bsd_image() {
+    local text
+    text="$(basename "$1") $([ -f "$1" ] && file -b "$1")"
+    [[ $(echo "$text" | tr '[:upper:]' '[:lower:]') =~ openbsd|freebsd|netbsd ]]
 }
 
 # Sets image or vm_dir from a menu of images in SEARCH_DIR and saved VMs.
@@ -503,17 +568,22 @@ cmd_boot() {   # cmd_boot NAME | cmd_boot "" [IMAGE]
 
     # Booting an image: work out the architecture.
     if [ -n "$image" ]; then
-        detected=$(detect_arch "$image")
-        if [ -z "$detected" ]; then
-            echo "Couldn't detect the architecture of $(basename "$image")."
-            select detected in arm64 amd64 i386; do [ -n "$detected" ] && break; done
+        detected=${known_arch:-$(detect_arch "$image")}
+        if [ -z "$detected" ] || [[ $detected == *" "* ]]; then
+            local candidates=${detected:-arm64 amd64 i386}
+            if [ -z "$detected" ]; then
+                echo "Couldn't detect the architecture of $(basename "$image")."
+            else
+                echo "$(basename "$image") has boot loaders for more than one architecture. Which is it?"
+            fi
+            select detected in $candidates; do [ -n "$detected" ] && break; done
             [ -n "$detected" ] || die "no architecture chosen"
         else
             echo "Detected architecture: $detected"
         fi
         # Name new VMs after the image, adding the arch unless it's already in there.
         default_name=$(basename "${image%.*}")
-        [ "$(detect_arch "$default_name")" = "$detected" ] || default_name+="-$detected"
+        [ "$(arch_from_name "$default_name")" = "$detected" ] || default_name+="-$detected"
         arch=$detected
     fi
 
@@ -556,20 +626,38 @@ cmd_boot() {   # cmd_boot NAME | cmd_boot "" [IMAGE]
         arch=$(conf_get "$vm_dir" arch)
         [ -n "$arch" ] || die "$vm_dir has no saved architecture; can't tell which QEMU to use"
     fi
-    local mem cpus ssh_port display firmware
+    local mem cpus ssh_port display firmware hw gpu
     mem=${opt_mem:-$(conf_get "$vm_dir" mem)};   mem=${mem:-$DEFAULT_MEM}
     cpus=${opt_cpus:-$(conf_get "$vm_dir" cpus)}; cpus=${cpus:-$DEFAULT_CPUS}
     ssh_port=${opt_ssh:-$(conf_get "$vm_dir" ssh_port)}
     [ "$ssh_port" = 0 ] && ssh_port=""
     display=${opt_display:-$(conf_get "$vm_dir" display)}
-    # arm64 firmware and boot loaders talk to the serial port, so the terminal
-    # is the natural default there; x86 installers usually expect a screen.
     if [ -z "$display" ]; then
-        [ "$arch" = arm64 ] && display=terminal || display=window
+        if [ -n "$image" ]; then
+            is_bsd_image "$image" && display=terminal || display=window
+        else
+            # VMs from older versions of vmboot: arm64 used the serial console.
+            [ "$arch" = arm64 ] && display=terminal || display=window
+        fi
     fi
     firmware=${opt_firmware:-$(conf_get "$vm_dir" firmware)}
-    firmware=${firmware:-uefi}
+    if [ -z "$firmware" ]; then
+        if [ "$arch" != arm64 ] && [ -f "$image" ] && ! has_efi_loader "$image"; then
+            echo "No UEFI boot loader in $(basename "$image"); using legacy BIOS."
+            firmware=bios
+        else
+            firmware=uefi
+        fi
+    fi
     [ "$arch" = arm64 ] && [ "$firmware" = bios ] && die "arm64 guests always boot with UEFI"
+    # New x86 VMs get an AHCI disk and an e1000 network card, which every x86
+    # OS has drivers for (ReactOS and ZealOS don't do virtio). arm64 OSes all
+    # speak virtio, and so did VMs from older versions of vmboot.
+    gpu=${opt_gpu:-$(conf_get "$vm_dir" gpu)}; gpu=${gpu:-virtio}
+    hw=$(conf_get "$vm_dir" hw)
+    if [ -z "$hw" ]; then
+        [ $new_vm -eq 1 ] && [ "$arch" != arm64 ] && hw=standard || hw=virtio
+    fi
 
     if [ -n "$ssh_port" ] && lsof -nP -iTCP:"$ssh_port" -sTCP:LISTEN >/dev/null 2>&1; then
         die "port $ssh_port is already in use on this Mac; pick another with -p"
@@ -628,24 +716,35 @@ cmd_boot() {   # cmd_boot NAME | cmd_boot "" [IMAGE]
         args+=(-drive "if=pflash,format=raw,unit=1,file=$vars")
     fi
 
+    local disk_if=virtio nic=virtio-net-pci
+    [ "$hw" = standard ] && disk_if=ide nic=e1000   # on q35, "ide" is AHCI
+
     args+=(-name "$name" -m "$mem" -smp "$cpus")
-    [ "$mode" = live ] || args+=(-drive "file=$disk,if=virtio,format=qcow2")
-    args+=(-nic "user,model=virtio-net-pci${ssh_port:+,hostfwd=tcp:127.0.0.1:$ssh_port-:22}")
+    [ "$mode" = live ] || args+=(-drive "file=$disk,if=$disk_if,format=qcow2")
+    args+=(-nic "user,model=$nic${ssh_port:+,hostfwd=tcp:127.0.0.1:$ssh_port-:22}")
     args+=(-pidfile "$vm_dir/qemu.pid")
 
     if [ -n "$image" ]; then
-        case $image in
-            *.iso|*.ISO) args+=(-drive "file=$image,media=cdrom,readonly=on") ;;
-            # .img installers (e.g. OpenBSD's install*.img) are disk images, not CDs
-            *) args+=(-drive "file=$image,if=virtio,format=raw,readonly=on") ;;
-        esac
+        if ! is_cd_image "$image"; then
+            # Disk images (OpenBSD's install*.img, Redox's livedisk.iso). The
+            # guest's writes go to a temporary overlay, never the image.
+            args+=(-drive "file=$image,if=$disk_if,format=raw,snapshot=on")
+        elif [ "$arch" = arm64 ]; then
+            # The virt machine has no IDE, so the CD goes on virtio-scsi.
+            args+=(-device virtio-scsi-pci -drive "if=none,id=cd,media=cdrom,readonly=on,file=$image" -device scsi-cd,drive=cd)
+        else
+            args+=(-drive "file=$image,media=cdrom,readonly=on")
+        fi
     fi
 
     if [ "$display" = terminal ]; then
         args+=(-nographic)
     else
         args+=(-display cocoa)
-        [ "$arch" = arm64 ] && args+=(-device virtio-gpu-pci -device qemu-xhci -device usb-kbd -device usb-tablet)
+        if [ "$arch" = arm64 ]; then
+            [ "$gpu" = ramfb ] && args+=(-device ramfb) || args+=(-device virtio-gpu-pci)
+            args+=(-device qemu-xhci -device usb-kbd -device usb-tablet)
+        fi
     fi
 
     # ---- create or update the VM's files ----
@@ -665,6 +764,8 @@ mem=$mem
 cpus=$cpus
 display=$display
 ssh_port=${ssh_port:-0}
+hw=$hw
+gpu=$gpu
 EOF
     fi
     [ -z "$image" ] || log_image_boot "$image"
@@ -672,6 +773,8 @@ EOF
     if [ "$display" = terminal ]; then
         echo "Serial console in this terminal. Quit QEMU with Ctrl-A then X."
         [ "$arch" != arm64 ] && echo "Tip: if output stops after the boot loader, type 'set tty com0' at the boot> prompt."
+    elif [ "$arch" = arm64 ] && [ "$gpu" = virtio ]; then
+        echo "Tip: if the window stays blank once the OS is up, try again with -r, or -t for the serial console."
     fi
     [ -n "$ssh_port" ] && echo "SSH: once the guest runs sshd, connect with: ssh -p $ssh_port <user>@localhost"
 
@@ -695,6 +798,271 @@ EOF
     after_throwaway "$default_name"
 }
 
+# ---- sync / get ----
+
+# Catalog lines are tab-separated:
+#   distro  variant  version  arch  url  sha256  display
+# display is "window" for desktop images (so arm64 ones don't default to the
+# serial console) and empty otherwise. Each sync_<distro> prints its lines,
+# default variant first.
+
+sync_fedora() {
+    local json ver
+    json=$(curl -fsSL https://getfedora.org/releases.json) || return 1
+    ver=$(jq -r '[.[].version | select(test("^[0-9]+$")) | tonumber] | max' <<<"$json")
+    jq -r --arg v "$ver" '
+        [ .[] | select(.version == $v and (.arch == "aarch64" or .arch == "x86_64"))
+              | (if   (.link | test("Workstation-Live")) then [0, "workstation", "window"]
+                 elif (.link | test("KDE-Desktop-Live")) then [1, "kde", "window"]
+                 elif (.link | test("Server-dvd"))       then [2, "server", ""]
+                 elif (.link | test("Everything-netinst")) then [3, "netinst", ""]
+                 else empty end) as $m
+              | [$m[0], "fedora", $m[1], .version,
+                 (if .arch == "aarch64" then "arm64" else "amd64" end), .link, .sha256, $m[2]] ]
+        | sort_by(.[0]) | .[] | .[1:] | @tsv' <<<"$json"
+}
+
+sync_alpine() {
+    local a arch yaml
+    for a in aarch64 x86_64; do
+        [ $a = aarch64 ] && arch=arm64 || arch=amd64
+        yaml=$(curl -fsSL "https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/$a/latest-releases.yaml") || return 1
+        # Each "-" starts a release; its fields are "  key: value" lines.
+        awk -v arch=$arch -v a=$a '
+            function flush() {
+                if (r["file"] ~ /\.iso$/ && r["flavor"] ~ /^alpine-(standard|virt|extended)$/) {
+                    v = r["flavor"]; sub(/^alpine-/, "", v)
+                    printf "alpine\t%s\t%s\t%s\thttps://dl-cdn.alpinelinux.org/alpine/%s/releases/%s/%s\t%s\t\n",
+                        v, r["version"], arch, r["branch"], a, r["file"], r["sha256"]
+                }
+                split("", r)
+            }
+            /^-/ { flush() }
+            /^  [a-z0-9]+: / { k = $1; sub(/:$/, "", k); v = $0; sub(/^  [a-z0-9]+: /, "", v); r[k] = v }
+            END { flush() }' <<<"$yaml" |
+            # standard first, as the default
+            awk -F'\t' '$2 == "standard" { print; next } { rest = rest $0 "\n" } END { printf "%s", rest }'
+    done
+}
+
+sync_ubuntu() {
+    local ver dir arch base sums type line file
+    # The newest LTS that's still supported.
+    ver=$(curl -fsSL https://changelogs.ubuntu.com/meta-release-lts |
+        awk '/^Version:/ { v = $2 } /^Supported: 1/ { s = v } END { print s }') || return 1
+    [ -n "$ver" ] || return 1
+    dir=$(echo "$ver" | cut -d. -f1,2)
+    for arch in amd64 arm64; do
+        # amd64 images live on releases.ubuntu.com, arm64 ones on cdimage.
+        if [ $arch = amd64 ]; then
+            base="https://releases.ubuntu.com/$dir"
+        else
+            base="https://cdimage.ubuntu.com/releases/$dir/release"
+        fi
+        sums=$(curl -fsSL "$base/SHA256SUMS") || return 1
+        for type in desktop live-server; do
+            line=$(grep -E " \*ubuntu-[0-9.]+-$type-$arch\.iso$" <<<"$sums" | sort -t'*' -k2 -V | tail -1)
+            [ -n "$line" ] || continue
+            file=${line#*\*}
+            printf 'ubuntu\t%s\t%s\t%s\t%s/%s\t%s\t%s\n' \
+                "$([ $type = desktop ] && echo desktop || echo server)" \
+                "$(echo "$file" | sed 's/^ubuntu-\([0-9.]*\)-.*/\1/')" \
+                $arch "$base" "$file" "${line%% *}" \
+                "$([ $type = desktop ] && echo window)"
+        done
+    done
+}
+
+sync_openbsd() {
+    local versions v arch sums file sum
+    versions=$(curl -fsSL https://cdn.openbsd.org/pub/OpenBSD/ |
+        grep -o 'href="[0-9]*\.[0-9]*/"' | grep -o '[0-9]*\.[0-9]*' |
+        sort -t. -k1,1nr -k2,2nr | head -3) || return 1
+    for arch in arm64 amd64; do
+        # arm64 boots the .img as a disk; amd64 boots the CD image.
+        for v in $versions; do
+            [ $arch = arm64 ] && file="install${v/./}.img" || file="install${v/./}.iso"
+            sums=$(curl -fsSL "https://cdn.openbsd.org/pub/OpenBSD/$v/$arch/SHA256" 2>/dev/null) || continue
+            sum=$(sed -n "s/^SHA256 ($file) = //p" <<<"$sums" | head -1)
+            [ -n "$sum" ] || continue
+            printf 'openbsd\tinstall\t%s\t%s\thttps://cdn.openbsd.org/pub/OpenBSD/%s/%s/%s\t%s\t\n' \
+                "$v" $arch "$v" $arch "$file" "$sum"
+            break
+        done
+    done
+}
+
+cmd_sync() {
+    local d out tmp
+    command -v jq >/dev/null || die "jq not found (brew install jq)"
+    mkdir -p "$VM_ROOT"
+    tmp=$(mktemp "$VM_ROOT/.catalog.XXXXXX")
+    echo "Checking current releases:"
+    for d in $DISTROS; do
+        printf '  %-8s ' "$d"
+        if out=$(sync_$d 2>/dev/null) && [ -n "$out" ]; then
+            echo "$out" >> "$tmp"
+            echo "$(cut -f3 <<<"$out" | sort -u | tr '\n' ' ')"
+        else
+            echo "couldn't check; keeping what the catalog had"
+            [ -f "$CATALOG" ] && awk -F'\t' -v d="$d" '$1 == d' "$CATALOG" >> "$tmp"
+        fi
+    done
+    mv "$tmp" "$CATALOG"
+}
+
+# Syncs first if the catalog is missing or stale.
+ensure_catalog() {
+    if [ ! -f "$CATALOG" ]; then
+        cmd_sync
+    elif [ "$(stat -f %m "$CATALOG")" -lt $(( $(date +%s) - CATALOG_MAX_AGE_DAYS * 86400 )) ]; then
+        echo "The release list is over $CATALOG_MAX_AGE_DAYS days old; refreshing it."
+        cmd_sync || echo "Couldn't refresh it; using the old one."
+    fi
+    echo
+}
+
+host_arch() { [ "$(uname -m)" = arm64 ] && echo arm64 || echo amd64; }
+
+# Each line: an official URL prefix and the same tree on a mirror. Mirrors are
+# tried in this order, then the official URL itself.
+mirror_rules() {
+    if [ -f "$MIRRORS_FILE" ]; then
+        grep -v '^[[:space:]]*\(#\|$\)' "$MIRRORS_FILE"
+        return
+    fi
+    cat <<'EOF'
+https://download.fedoraproject.org/pub/fedora/  https://mirrors.rit.edu/fedora/fedora/
+https://download.fedoraproject.org/pub/fedora/  https://plug-mirror.rcac.purdue.edu/fedora/fedora/
+https://dl-cdn.alpinelinux.org/alpine/          https://plug-mirror.rcac.purdue.edu/alpine/
+https://releases.ubuntu.com/                    https://mirrors.rit.edu/ubuntu-releases/
+https://releases.ubuntu.com/                    https://plug-mirror.rcac.purdue.edu/ubuntu-releases/
+https://cdimage.ubuntu.com/                     https://mirrors.rit.edu/ubuntu-cdimage/
+https://cdn.openbsd.org/pub/OpenBSD/            https://mirrors.rit.edu/OpenBSD/
+https://cdn.openbsd.org/pub/OpenBSD/            https://plug-mirror.rcac.purdue.edu/openbsd/
+EOF
+}
+
+# Prints the URLs to try for a download, best first.
+sources_for() {
+    local url=$1 official mirror
+    while read -r official mirror; do
+        case $url in "$official"*) echo "$mirror${url#"$official"}" ;; esac
+    done < <(mirror_rules)
+    echo "$url"
+}
+
+sha256_of() { shasum -a 256 "$1" | cut -d' ' -f1; }
+
+# Downloads URL into SEARCH_DIR as FILE, trying mirrors first, and checks it
+# against SUM. Sets image_path. Interrupted downloads resume from FILE.part.
+download_image() {
+    local url=$1 sum=$2 file=$3 dest part src host
+    dest="$SEARCH_DIR/$file"
+    part="$dest.part"
+    image_path=$dest
+    if [ -f "$dest" ]; then
+        if [ "$(sha256_of "$dest")" = "$sum" ]; then
+            echo "Already downloaded: $dest"
+            return
+        fi
+        die "$dest is there but doesn't match the release checksum; move it aside first"
+    fi
+    if [ $DRY_RUN -eq 1 ]; then
+        echo "Would download $file, trying in order:"
+        sources_for "$url" | sed 's/^/  /'
+        return
+    fi
+    mkdir -p "$SEARCH_DIR"
+    local finished
+    while IFS= read -r src; do
+        host=$(echo "$src" | sed 's|^[a-z]*://\([^/]*\)/.*|\1|')
+        echo "Downloading $file from $host"
+        finished=1
+        curl -fL --progress-bar --retry 2 --connect-timeout 15 -C - -o "$part" "$src" || {
+            finished=0
+            echo "  couldn't get it from $host"
+        }
+        [ -f "$part" ] || continue
+        if [ "$(sha256_of "$part")" = "$sum" ]; then
+            mv "$part" "$dest"
+            echo "Checksum OK: $dest"
+            return
+        fi
+        # An unfinished download can carry on from the next source; a
+        # finished one with the wrong checksum is bad.
+        if [ $finished -eq 1 ]; then
+            echo "  the file from $host doesn't match the checksum; discarding it"
+            rm -f "$part"
+        fi
+    done < <(sources_for "$url")
+    die "couldn't download $file from any source (a partial download is kept as $part)"
+}
+
+default_variant() {
+    case $1 in
+        fedora)  echo workstation ;;
+        ubuntu)  echo desktop ;;
+        alpine)  echo standard ;;
+        openbsd) echo install ;;
+    esac
+}
+
+cmd_get_list() {
+    local arch=$1 distro variant version a url sum display file mark
+    echo "Available for $arch, last checked $(fmt_age "$(stat -f %m "$CATALOG")") (vmboot sync to refresh, -a for other architectures):"
+    while IFS=$'\t' read -r distro variant version a url sum display; do
+        [ "$a" = "$arch" ] || continue
+        file=$(get_filename "$distro" "$a" "$url")
+        mark=""
+        [ -f "$SEARCH_DIR/$file" ] && mark="downloaded"
+        [ "$variant" = "$(default_variant "$distro")" ] && mark="${mark:+$mark, }default"
+        printf '  %-22s %-9s %-46s %s\n' "$distro/$variant" "$version" "$file" "${mark:+($mark)}"
+    done < "$CATALOG"
+}
+
+# Local file name for a download: the release's own name, with the distro and
+# arch added if they're not already in it (OpenBSD's is just install80.img).
+get_filename() {
+    local distro=$1 arch=$2 file
+    file=$(basename "$3")
+    case $(echo "$file" | tr '[:upper:]' '[:lower:]') in *"$distro"*) ;; *) file="$distro-$file" ;; esac
+    arch_from_name "$file" >/dev/null || file="${file%.*}-$arch.${file##*.}"
+    echo "$file"
+}
+
+cmd_get() {   # cmd_get [DISTRO[/VARIANT]]
+    local arch=${opt_arch:-$(host_arch)} distro variant line version url sum display file
+    ensure_catalog
+    if [ -z "$1" ]; then
+        cmd_get_list "$arch"
+        return
+    fi
+
+    distro=$(echo "${1%%/*}" | tr '[:upper:]' '[:lower:]')
+    case " $DISTROS " in *" $distro "*) ;; *) die "don't know how to get '$distro' (I know: $DISTROS)" ;; esac
+    variant=${1#"${1%%/*}"}; variant=${variant#/}
+    variant=${variant:-$(default_variant "$distro")}
+
+    line=$(awk -F'\t' -v d="$distro" -v v="$variant" -v a="$arch" \
+        '$1 == d && $2 == v && $4 == a { print; exit }' "$CATALOG")
+    if [ -z "$line" ]; then
+        echo "No $distro/$variant for $arch in the release list. What there is for $distro:" >&2
+        awk -F'\t' -v d="$distro" '$1 == d { printf "  %s/%s (%s)\n", $1, $2, $4 }' "$CATALOG" >&2
+        exit 1
+    fi
+    IFS=$'\t' read -r _ _ version _ url sum display <<<"$line"
+    file=$(get_filename "$distro" "$arch" "$url")
+    echo "$distro/$variant $version for $arch"
+
+    download_image "$url" "$sum" "$file"
+    [ $DOWNLOAD_ONLY -eq 0 ] || return 0
+    echo
+    known_arch=$arch
+    opt_display=${opt_display:-$display}
+    cmd_boot "" "$image_path"
+}
+
 # ---- dispatch ----
 name=${positional[0]:-}
 nargs=${#positional[@]}
@@ -713,6 +1081,14 @@ case $cmd in
     boot)
         [ "$nargs" -eq 1 ] || bad_usage "usage: vmboot boot [options] NAME"
         cmd_boot "$name"
+        ;;
+    get)
+        [ "$nargs" -le 1 ] || bad_usage "usage: vmboot get [options] [DISTRO[/VARIANT]]"
+        cmd_get "$name"
+        ;;
+    sync)
+        [ "$nargs" -eq 0 ] || bad_usage "usage: vmboot sync"
+        cmd_sync
         ;;
     list)
         [ "$nargs" -eq 0 ] || bad_usage "usage: vmboot list"

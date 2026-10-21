@@ -32,16 +32,15 @@ before running one on a new machine.
 ### vmboot.sh
 
 For trying out operating systems on macOS without collecting VMs. Point it
-at an ISO (or pick one from a menu of `~/Downloads` and `~/VMs`) and it boots
-it in QEMU in a **throwaway VM**. When QEMU exits, you're asked whether to
+at an ISO, pick one from a menu of `~/Downloads` and `~/VMs`, or have it
+download the current release of a few distros, and it boots it in QEMU in a
+**throwaway VM**. When QEMU exits, you're asked whether to
 keep it. Say no and the VM is deleted, and you're offered the chance to
 delete the ISO too. Say yes and it becomes a saved VM in `~/VMs`.
 
-It works out the guest architecture from the file name, the ISO volume
-label, or the EFI loader inside the image. It uses HVF acceleration when the
-guest matches the host CPU and falls back to TCG emulation when it doesn't.
-arm64 guests default to a serial console in the terminal; x86 guests default
-to a Cocoa window.
+It uses HVF acceleration when the guest matches the host CPU and falls back
+to TCG emulation when it doesn't (so x86 guests on Apple Silicon work, just
+slowly).
 
 ```bash
 ./vmboot.sh ~/Downloads/fedora.iso   # try an image in a throwaway VM
@@ -58,6 +57,59 @@ If nothing was written to a throwaway VM's disk (you only poked around the
 installer), it's deleted without asking. Ctrl-C stops QEMU but still gets
 you the keep-or-delete prompt.
 
+**Getting current releases:**
+
+```bash
+./vmboot.sh get                  # what's available for this Mac's architecture
+./vmboot.sh get fedora           # download Fedora Workstation and try it
+./vmboot.sh get ubuntu/server    # a specific variant
+./vmboot.sh get -a amd64 alpine  # the x86-64 image instead
+./vmboot.sh get -d openbsd       # download only
+./vmboot.sh sync                 # refresh the list of current releases
+```
+
+`get` knows Fedora (workstation, kde, server, netinst), Ubuntu LTS (desktop,
+server), Alpine (standard, virt, extended) and OpenBSD (install). `sync`
+reads each project's own release index (Fedora's `releases.json`, Alpine's
+`latest-releases.yaml`, Ubuntu's LTS list and `SHA256SUMS`, OpenBSD's
+release folders and `SHA256` files) into `~/VMs/.catalog`. `get` refreshes it
+by itself when it's more than a week old.
+
+Downloads go to `~/Downloads`. They come from mirrors.rit.edu and
+plug-mirror.rcac.purdue.edu where those carry the file, falling back to the
+official site. Every file is checked against the checksum from the
+official index, and an interrupted download resumes on the next run. To
+use other mirrors, create `~/VMs/mirrors` with one `official-prefix
+mirror-prefix` pair per line, in the order to try them:
+
+```
+https://releases.ubuntu.com/   https://mirrors.example.edu/ubuntu-releases/
+```
+
+**How images are set up.** vmboot looks at each image to choose sensible
+defaults:
+
+- **Architecture:** from the file name, the volume label, or the UEFI boot
+  loaders inside it. If there are loaders for several architectures (some
+  hobby OSes ship them all), it asks.
+- **CD or disk:** real ISO 9660 images are attached as a CD; anything else
+  is attached as a disk, even if it's named `.iso` (Redox's live disk is
+  one). The guest's writes to a disk image go to a temporary overlay, so the
+  image itself is never changed.
+- **Firmware:** x86 images with no UEFI boot loader (e.g. ReactOS) boot with
+  legacy BIOS.
+- **Hardware:** new x86 VMs get an AHCI disk and an e1000 network card,
+  which every x86 OS supports. arm64 VMs use virtio.
+- **Display:** OpenBSD, FreeBSD and NetBSD get the serial console in the
+  terminal; everything else gets a window. arm64 windows use virtio-gpu,
+  which Linux needs. Some OSes (Redox, for one) only draw to the boot
+  framebuffer, which virtio-gpu stops showing once the OS starts; if the
+  window stays blank, boot again with `-r` for a plain framebuffer (ramfb).
+  Linux live images can take a minute or so to show anything.
+
+These were tried against FreeBSD, OpenBSD, Void, Redox, ReactOS, ZealOS and
+Haiku images; all of them reached their installer, desktop or login.
+
 **Cleaning up:**
 
 ```bash
@@ -72,15 +124,15 @@ was killed. vmboot records image boots in `~/VMs/.image-history`; a VM's
 "last used" is when its disk was last written.
 
 **Remembered settings.** RAM (`-m`), CPUs (`-c`), SSH port (`-p`, `-p 0`
-turns it off), firmware (`-f`) and display (`-g`/`-t`) are saved in the VM's
+turns it off), firmware (`-f`) and display (`-g`/`-t`/`-r`) are saved in the VM's
 `vm.conf` and reused on its next boot, so you only pass them when changing
 something.
 
-**Firmware.** Every VM boots UEFI with its own writable variable store
+**Firmware.** UEFI VMs get their own writable variable store
 (`efivars.fd`), so boot entries an installer writes survive a reboot. x86
 guests can use `-f bios` for legacy BIOS instead. VMs created by older
-versions of vmboot (just an `arch` file) are picked up automatically, and
-x86 ones keep booting with BIOS.
+versions of vmboot (just an `arch` file) are picked up automatically: x86
+ones keep booting with BIOS, and all of them keep virtio hardware.
 
 **Managing saved VMs:**
 
@@ -100,7 +152,8 @@ folder).
 Each VM lives in `~/VMs/<name>/`; set `VM_ROOT` to keep them elsewhere. Quit
 a serial-console guest with Ctrl-A then X.
 
-**Needs:** `brew install qemu`.
+**Needs:** `brew install qemu`, plus `jq` for `sync`/`get` (included with
+recent macOS, or `brew install jq`).
 
 ---
 
