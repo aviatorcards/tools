@@ -8,7 +8,7 @@ before running one on a new machine.
 
 | Tool | Language | What it does |
 | --- | --- | --- |
-| [vmboot.sh](#vmbootsh) | Bash | Pick an ISO or existing VM from a menu and boot it in QEMU |
+| [vmboot.sh](#vmbootsh) | Bash | Boot ISOs and VMs in QEMU from a menu, and manage the VMs |
 | [setup_wp.sh](#setup_wpsh) | Bash | Stand up a new WordPress site behind Apache on a Linux server |
 | [github_mirror.py](#github_mirrorpy) | Python | Mirror every bare repo on a self-hosted git server to GitHub |
 | [convert.py](#convertpy) | Python | Convert a tree of FLAC files to 320 kbps MP3 |
@@ -31,24 +31,52 @@ before running one on a new machine.
 
 ### vmboot.sh
 
-Menu-driven QEMU launcher for macOS. It lists the `.iso`/`.img` files in
-`~/Downloads` plus any VMs already in `~/VMs`, works out the guest
-architecture (from the file name, the ISO volume label, or the EFI loader
-inside the image), creates a qcow2 disk for new VMs, and boots it. It uses
-HVF acceleration when the guest matches the host CPU and falls back to TCG
-emulation when it doesn't. arm64 guests default to a serial console in the
-terminal; x86 guests default to a Cocoa window.
+QEMU launcher and VM manager for macOS. With no arguments it shows a menu of
+the `.iso`/`.img` files in `~/Downloads` plus the VMs already in `~/VMs`.
+For a new install it works out the guest architecture (from the file name,
+the ISO volume label, or the EFI loader inside the image), creates a qcow2
+disk and boots the installer. It uses HVF acceleration when the guest
+matches the host CPU and falls back to TCG emulation when it doesn't. arm64
+guests default to a serial console in the terminal; x86 guests default to a
+Cocoa window.
 
 ```bash
-./vmboot.sh                     # pick from ~/Downloads and ~/VMs
-./vmboot.sh -s ~/isos -m 4G -c 4
-./vmboot.sh -n                  # dry run: print the QEMU command only
-./vmboot.sh -h                  # all options
+./vmboot.sh                       # pick from ~/Downloads and ~/VMs
+./vmboot.sh -s ~/isos -m 4G -c 4  # look elsewhere, bigger VM
+./vmboot.sh boot openbsd          # boot an installed VM directly
+./vmboot.sh boot openbsd -p 2222  # ...with ssh -p 2222 user@localhost forwarded in
+./vmboot.sh -n                    # dry run: print the QEMU command only
+./vmboot.sh -h                    # all options
 ```
 
-Each VM lives in `~/VMs/<name>/` as `disk.qcow2` plus an `arch` file
-(override the location with `VM_ROOT`). Quit a serial-console guest with
-Ctrl-A then X.
+**Remembered settings.** RAM (`-m`), CPUs (`-c`), SSH port (`-p`, `-p 0`
+turns it off), firmware (`-f`) and display (`-g`/`-t`) are saved in the VM's
+`vm.conf` and reused on its next boot, so you only pass them when changing
+something.
+
+**Firmware.** Every VM boots UEFI with its own writable variable store
+(`efivars.fd`), so boot entries an installer writes survive a reboot. x86
+guests can use `-f bios` for legacy BIOS instead. VMs created by older
+versions of vmboot (just an `arch` file) are picked up automatically, and
+x86 ones keep booting with BIOS.
+
+**Managing VMs:**
+
+```bash
+./vmboot.sh list                     # arch, firmware, RAM, CPUs, SSH port, disk use, snapshots, running?
+./vmboot.sh snapshot openbsd fresh   # snapshot the disk (tag defaults to a timestamp)
+./vmboot.sh snapshots openbsd        # list snapshots
+./vmboot.sh restore openbsd fresh    # roll back (asks first)
+./vmboot.sh delsnap openbsd fresh    # delete a snapshot
+./vmboot.sh delete openbsd           # delete the VM (type its name to confirm)
+```
+
+Snapshots cover the disk only, not `efivars.fd`. These commands, and `boot`,
+refuse to touch a VM that's running (tracked through `qemu.pid` in its
+folder).
+
+Each VM lives in `~/VMs/<name>/`; set `VM_ROOT` to keep them elsewhere. Quit
+a serial-console guest with Ctrl-A then X.
 
 **Needs:** `brew install qemu`.
 
