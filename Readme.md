@@ -8,7 +8,7 @@ before running one on a new machine.
 
 | Tool | Language | What it does |
 | --- | --- | --- |
-| [vmboot.sh](#vmbootsh) | Bash | Boot ISOs and VMs in QEMU from a menu, and manage the VMs |
+| [vmboot.sh](#vmbootsh) | Bash | Try OS images in throwaway QEMU VMs, keep the ones you like, clean up the rest |
 | [setup_wp.sh](#setup_wpsh) | Bash | Stand up a new WordPress site behind Apache on a Linux server |
 | [github_mirror.py](#github_mirrorpy) | Python | Mirror every bare repo on a self-hosted git server to GitHub |
 | [convert.py](#convertpy) | Python | Convert a tree of FLAC files to 320 kbps MP3 |
@@ -31,23 +31,45 @@ before running one on a new machine.
 
 ### vmboot.sh
 
-QEMU launcher and VM manager for macOS. With no arguments it shows a menu of
-the `.iso`/`.img` files in `~/Downloads` plus the VMs already in `~/VMs`.
-For a new install it works out the guest architecture (from the file name,
-the ISO volume label, or the EFI loader inside the image), creates a qcow2
-disk and boots the installer. It uses HVF acceleration when the guest
-matches the host CPU and falls back to TCG emulation when it doesn't. arm64
-guests default to a serial console in the terminal; x86 guests default to a
-Cocoa window.
+For trying out operating systems on macOS without collecting VMs. Point it
+at an ISO (or pick one from a menu of `~/Downloads` and `~/VMs`) and it boots
+it in QEMU in a **throwaway VM**. When QEMU exits, you're asked whether to
+keep it. Say no and the VM is deleted, and you're offered the chance to
+delete the ISO too. Say yes and it becomes a saved VM in `~/VMs`.
+
+It works out the guest architecture from the file name, the ISO volume
+label, or the EFI loader inside the image. It uses HVF acceleration when the
+guest matches the host CPU and falls back to TCG emulation when it doesn't.
+arm64 guests default to a serial console in the terminal; x86 guests default
+to a Cocoa window.
 
 ```bash
-./vmboot.sh                       # pick from ~/Downloads and ~/VMs
-./vmboot.sh -s ~/isos -m 4G -c 4  # look elsewhere, bigger VM
-./vmboot.sh boot openbsd          # boot an installed VM directly
-./vmboot.sh boot openbsd -p 2222  # ...with ssh -p 2222 user@localhost forwarded in
-./vmboot.sh -n                    # dry run: print the QEMU command only
-./vmboot.sh -h                    # all options
+./vmboot.sh ~/Downloads/fedora.iso   # try an image in a throwaway VM
+./vmboot.sh                          # pick from ~/Downloads and ~/VMs
+./vmboot.sh -l live.iso              # live ISO: no disk at all, nothing to keep
+./vmboot.sh -k openbsd.iso           # make a saved VM straight away
+./vmboot.sh boot openbsd             # boot a saved VM
+./vmboot.sh boot openbsd -p 2222     # ...with ssh -p 2222 user@localhost forwarded in
+./vmboot.sh -n                       # dry run: print the QEMU command only
+./vmboot.sh -h                       # all options
 ```
+
+If nothing was written to a throwaway VM's disk (you only poked around the
+installer), it's deleted without asking. Ctrl-C stops QEMU but still gets
+you the keep-or-delete prompt.
+
+**Cleaning up:**
+
+```bash
+./vmboot.sh images     # ISOs in ~/Downloads: size, when downloaded, when last booted
+./vmboot.sh clean      # offer to delete images and VMs not used in 30 days
+./vmboot.sh clean 7    # ...or in 7 days
+```
+
+`clean` asks about each item (y/n, or q to stop) and tells you how much
+space it freed. It also removes throwaway VMs left behind if vmboot itself
+was killed. vmboot records image boots in `~/VMs/.image-history`; a VM's
+"last used" is when its disk was last written.
 
 **Remembered settings.** RAM (`-m`), CPUs (`-c`), SSH port (`-p`, `-p 0`
 turns it off), firmware (`-f`) and display (`-g`/`-t`) are saved in the VM's
@@ -60,10 +82,10 @@ guests can use `-f bios` for legacy BIOS instead. VMs created by older
 versions of vmboot (just an `arch` file) are picked up automatically, and
 x86 ones keep booting with BIOS.
 
-**Managing VMs:**
+**Managing saved VMs:**
 
 ```bash
-./vmboot.sh list                     # arch, firmware, RAM, CPUs, SSH port, disk use, snapshots, running?
+./vmboot.sh list                     # arch, firmware, RAM, CPUs, SSH, disk use, snapshots, state, last used
 ./vmboot.sh snapshot openbsd fresh   # snapshot the disk (tag defaults to a timestamp)
 ./vmboot.sh snapshots openbsd        # list snapshots
 ./vmboot.sh restore openbsd fresh    # roll back (asks first)
