@@ -2,7 +2,7 @@
 
 if [ "$EUID" -ne 0 ]; then 
   echo "Please run as root (use sudo)"
-  exit 1
+  exit
 fi
 
 export PATH="/usr/local/bin:$PATH"
@@ -10,20 +10,21 @@ export PATH="/usr/local/bin:$PATH"
 read -p "Enter the domain name (e.g., site.com): " DOMAIN
 read -p "Enter admin email (default: tristan@fddl.dev): " ADMIN_EMAIL
 ADMIN_EMAIL=${ADMIN_EMAIL:-tristan@fddl.dev}
+read -p "Enter admin username (default: tristan): " ADMIN_USER
+ADMIN_USER=${ADMIN_USER:-tristan}
 
-LAST_PORT=$(grep "^Listen" /etc/httpd/conf.d/ports.conf 2>/dev/null | awk '{print $2}' | sort -n | tail -1)
-LAST_PORT=${LAST_PORT:-8079}
+LAST_PORT=$(grep "Listen" /etc/httpd/conf.d/ports.conf | awk '{print $2}' | sort -n | tail -1)
 PORT=$((LAST_PORT + 1))
 
 echo "------------------------------------------"
 echo "Setting up $DOMAIN on Port $PORT"
 echo "------------------------------------------"
 
-DB_NAME=$(echo $DOMAIN | tr ".-" "__")
+DB_NAME=$(echo $DOMAIN | tr "." "_")
 DB_USER="${DB_NAME}_user"
 DB_PASS=$(openssl rand -base64 12)
 
-if mysql -e "SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME='$DB_NAME'" 2>/dev/null | grep -q "$DB_NAME"; then
+if mysql -e "use $DB_NAME" 2>/dev/null; then
     echo "Warning: Database $DB_NAME already exists."
     read -p "Would you like to DROP the existing database and user? (y/N): " CONFIRM_DB
     if [[ "$CONFIRM_DB" =~ ^[Yy]$ ]]; then
@@ -42,9 +43,8 @@ mysql -e "ALTER USER '$DB_USER'@'localhost' IDENTIFIED BY '$DB_PASS';"
 mysql -e "GRANT ALL PRIVILEGES ON \`$DB_NAME\`.* TO '$DB_USER'@'localhost';"
 mysql -e "FLUSH PRIVILEGES;"
 
-WEB_DIR="/mnt/storage/www/$DOMAIN"
-WP_ARCHIVE_TAR="/mnt/storage/www/latest.tar.gz"
-WP_ARCHIVE_ZIP="/mnt/storage/www/latest.zip"
+WEB_DIR="/var/www/html/$DOMAIN"
+WP_ARCHIVE="/home/tristan/latest.tar.gz"
 
 if [ -d "$WEB_DIR" ]; then
     echo "Warning: Directory $WEB_DIR already exists."
@@ -59,13 +59,8 @@ if [ -d "$WEB_DIR" ]; then
 fi
 
 mkdir -p "$WEB_DIR"
-if [ -f "$WP_ARCHIVE_TAR" ]; then
-    tar -xzf "$WP_ARCHIVE_TAR" -C "$WEB_DIR" --strip-components=1
-elif [ -f "$WP_ARCHIVE_ZIP" ]; then
-    EXTRACT_TMP=$(mktemp -d)
-    unzip -q "$WP_ARCHIVE_ZIP" -d "$EXTRACT_TMP"
-    mv "$EXTRACT_TMP"/wordpress/* "$WEB_DIR/"
-    rm -rf "$EXTRACT_TMP"
+if [ -f "$WP_ARCHIVE" ]; then
+    tar -xzf "$WP_ARCHIVE" -C "$WEB_DIR" --strip-components=1
 else
     wp core download --path="$WEB_DIR" --allow-root
 fi
@@ -105,17 +100,13 @@ if ! grep -q "Listen $PORT" /etc/httpd/conf.d/ports.conf; then
 fi
 
 if command -v semanage > /dev/null; then
-    if ! semanage port -l | grep "^http_port_t" | grep -qP "\b$PORT\b"; then
-        if semanage port -l | grep -qP "\b$PORT\b"; then
-            semanage port -m -t http_port_t -p tcp $PORT
-        else
-            semanage port -a -t http_port_t -p tcp $PORT
-        fi
+    if ! semanage port -l | grep -q "\b$PORT\b"; then
+        semanage port -a -t http_port_t -p tcp $PORT
     fi
 fi
 
 ADMIN_PASS=$(openssl rand -base64 16)
-wp core install --url="https://$DOMAIN" --title="$DOMAIN" --admin_user="tristan" --admin_password="$ADMIN_PASS" --admin_email="$ADMIN_EMAIL" --skip-email --allow-root
+wp core install --url="https://$DOMAIN" --title="$DOMAIN" --admin_user="$ADMIN_USER" --admin_password="$ADMIN_PASS" --admin_email="$ADMIN_EMAIL" --skip-email --allow-root
 
 wp plugin install wordfence --activate --allow-root
 
@@ -143,7 +134,7 @@ echo "Port:     $PORT"
 echo "DB Name:  $DB_NAME"
 echo "DB User:  $DB_USER"
 echo "DB Pass:  $DB_PASS"
-echo "Admin:    tristan"
+echo "Admin:    $ADMIN_USER"
 echo "Pass:     $ADMIN_PASS"
 echo "------------------------------------------"
 echo "ACTION REQUIRED: Map $DOMAIN to http://localhost:$PORT in Cloudflare."
